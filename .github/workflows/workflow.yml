@@ -1,0 +1,322 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+    - main
+    - feature/*
+  pull_request:
+    branches:
+    - main
+# defined in the job below
+# Permissions required for OIDC token generation
+# permissions:
+#   id-token: write
+#   contents: read
+
+env:
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP}}
+  WEBAPP_NAME: ${{ secrets.WEBAPP_NAME }}
+  
+  APP_NAME:  ${{ vars.APP_NAME }}
+  ACR_REPO_NAME: ${{ vars.ACR_REPO_NAME }}
+  
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-image-tag.outputs.image_tag }}
+    steps:
+    # Checkout the repository
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Set up Python
+    - name: Set up Python 3.13
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.13
+
+    # Install dependencies for testing
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    # Run pytest tests
+    - name: Run tests
+      run: pytest test_main.py
+
+    # Set up Docker Buildx
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    # Build Docker image
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.APP_NAME }}:${{ github.sha }} .
+
+    # Save image tag as output
+    - name: Set image tag
+      id: set-image-tag
+      run: echo "image_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+    # Save Docker image as artifact
+    - name: Save Docker image
+      run: |
+        docker save ${{env.APP_NAME}}:${{ github.sha }} | gzip > image.tar.gz
+
+    # Upload Docker image artifact
+    - name: Upload Docker image
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-image
+        path: image.tar.gz
+
+  scan-image:
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    steps:
+    # Checkout the repository
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Download Docker image artifact
+    - name: Download Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+        path: .
+
+    # Load Docker image
+    - name: Load Docker image
+      run: |
+        docker load < image.tar.gz
+
+    # Install Trivy for static scanning
+    - name: Install Trivy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget
+        wget https://github.com/aquasecurity/trivy/releases/download/v0.58.1/trivy_0.58.1_Linux-64bit.deb
+        sudo dpkg -i trivy_0.58.1_Linux-64bit.deb
+
+    # Run Trivy scan and save output in JSON and text formats
+    - name: Run Trivy vulnerability scanner
+      run: |
+        trivy image --severity HIGH,CRITICAL --format json --output trivy_scan_result.json ${{ env.APP_NAME }}:${{ needs.test-and-build.outputs.image_tag }}
+        trivy image --severity HIGH,CRITICAL --format table ${{ env.APP_NAME }}:${{ needs.test-and-build.outputs.image_tag }} > Trivy_scan_result.txt
+
+    # Check CRITICAL vulnerabilities count and set exit code
+    - name: Check CRITICAL vulnerabilities count
+      run: |
+        CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy_scan_result.json)
+        echo "Found $CRITICAL_COUNT CRITICAL vulnerabilities"
+        if [ "$CRITICAL_COUNT" -ge ${{ vars.QUALITY_GATE }} ]; then
+          echo "Threshold of 10 CRITICAL vulnerabilities exceeded"
+          exit 1
+        fi
+
+    # Upload Trivy scan result as artifact
+    - name: Upload Trivy scan result
+      uses: actions/upload-artifact@v4
+      with:
+        name: Trivy_scan_result
+        path: Trivy_scan_result.txt
+
+  push-to-azure-acr:
+    runs-on: ubuntu-latest
+    needs:
+    - scan-image
+    - test-and-build    
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      acr_address: ${{ steps.tag-and-push.outputs.acr_address }}
+    steps:
+    # Checkout the repository
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Download Docker image artifact
+    - name: Download Docker image
+      uses: actions/download-artifact@v4
+      with:
+        name: docker-image
+        path: .        
+
+    # Load Docker image
+    - name: Load Docker image
+      run: |
+        docker load < image.tar.gz
+
+    # Authentication with Azure using OIDC
+    - name: Login to Azure with OIDC
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    # Login to Azure ACR authenticated via OIDC
+    - name: Login to Azure ACR
+      id: login-acr
+      run: |
+        az acr login --name ${{ env.ACR_NAME }}
+
+
+    # Configure AWS credentials for ECR
+    # - name: Configure AWS Credentials
+    #   uses: aws-actions/configure-aws-credentials@v4
+    #   with:
+    #     role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+    #     aws-region: ${{ vars.AWS_REGION }}
+
+    # Login to AWS ECR
+    # - name: Login to Amazon ECR
+    #   id: login-ecr
+    #   uses: aws-actions/amazon-ecr-login@v2
+
+    # Tag and push Docker image to ECR
+    - name: Tag and push Docker image to ECR
+      id: tag-and-push
+      env:
+        ACR_REGISTRY: ${{ steps.login-acr.outputs.registry }}
+        ACR_REPOSITORY: ${{ env.ACR_REPO_NAME }}
+        LATEST_TAG: latest
+        IMAGE_TAG: ${{ needs.test-and-build.outputs.image_tag }}
+      run: |
+        echo ---------------------------        
+        echo "acr_address=$ACR_REGISTRY"
+        echo "acr_address=$ACR_REGISTRY" >> $GITHUB_OUTPUT
+        docker tag ${{ env.APP_NAME }}:$IMAGE_TAG $ACR_REGISTRY/$ACR_REPOSITORY:$IMAGE_TAG 
+        docker tag ${{ env.APP_NAME }}:$IMAGE_TAG $ACR_REGISTRY/$ACR_REPOSITORY:$LATEST_TAG
+        docker push $ACR_REGISTRY/$ACR_REPOSITORY:$IMAGE_TAG
+        docker push $ACR_REGISTRY/$ACR_REPOSITORY:$LATEST_TAG
+
+  deploy:
+    needs: 
+      - scan-image
+      - test-and-build
+      - push-to-azure-acr
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      APP_ALB_HOST_URL: ${{ steps.set-ingress-host-address.outputs.APP_ALB_HOST_URL }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Authentication with Azure using OIDC
+    - name: Login to Azure with OIDC
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Update WebApp contianer settings
+      env:
+        ACR_REPOSITORY: ${{ env.ACR_REPO_NAME }}
+        IMAGE_TAG: ${{ needs.test-and-build.outputs.image_tag }}
+      run: |
+        az webapp config container set \
+          --name ${{ env.WEBAPP_NAME }} \
+          --resource-group ${{ env.RESOURCE_GROUP }} \
+          --docker-custom-image-name: ${{ env.ACR_NAME }}.azurecr.io/${{ env.ACR_REPO_NAME }}:$IMAGE_TAG \
+          --docker-registry-servdr-url https://${{ env.ACR_NAME }}.azurecr.io
+
+    # Restart Web App to apply the new container image
+    - name: Restart Web App
+      run: |
+        az webapp restart --name $${{ env.WEBAPP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
+
+    # # Configure AWS credentials for ECR
+    # - name: Configure AWS Credentials
+    #   uses: aws-actions/configure-aws-credentials@v4
+    #   with:
+    #     role-to-assume: ${{ secrets.AWS_ROLE_ARN_FOR_DEPLOY }}
+    #     aws-region: ${{ vars.AWS_REGION }}
+
+    # - name: Update Kubeconfig
+    #   uses: silverlyra/setup-aws-eks@v0.1
+    #   with:
+    #       cluster: ${{ vars.EKS_CLUSTER_NAME }}
+
+    # - name: Check K8s cluster reachable by getting K8s nodes
+    #   run: |
+    #     echo ---------------------------
+    #     kubectl get nodes
+
+    # # add variables for NAMESPACE, REPLICAS, K8s_Image
+    # - name: Replace Token in Manifest files      
+    #   uses: cschleiden/replace-tokens@v1
+    #   with:
+    #     tokenPrefix: '${'
+    #     tokenSuffix: '}'
+    #     files: '["kubernetes/*.yaml"]'
+    #   env:
+    #     NAMESPACE: ${{ vars.NAMESPACE }}
+    #     K8S_IMAGE_ECR: ${{ needs.push-to-ecr.outputs.ecr_address }}
+    #     K8S_IMAGE_REPO: ${{ env.ECR_REPO_NAME }}
+    #     K8S_IMAGE_TAG: ${{ needs.test-and-build.outputs.image_tag }}
+
+    # - name: Check files were updated
+    #   run: |
+    #     cat kubernetes/*.yaml   
+
+    # - name: Deploy to EKS
+    #   env:
+    #     NAMESPACE: ${{ vars.NAMESPACE }}
+    #     ACR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+    #     ACR_REPOSITORY: ${{ env.ACR_NAME }}
+    #     IMAGE_FULL_TAG: ${{ needs.push-to-ecr.outputs.IMAGE_FULL_TAG }}
+    #   run: |
+    #     kubectl apply -f kubernetes/
+    #     kubectl rollout status deployment/python-app -n $NAMESPACE        
+
+    # - name: Set App Ingress Host URL
+    #   id: set-ingress-host-address
+    #   run: |  
+    #     echo "APP_ALB_HOST_URL=$(kubectl -n ${{ vars.NAMESPACE }} get ing -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')" >> $GITHUB_OUTPUT
+
+
+  integration-testing:
+    name: ENV Integration Testing
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+    - name: Test URL Output using curl and jq
+      env:
+        URL: ${{ needs.dev-deploy.outputs.APP_ALB_HOST_URL }}
+        SITE_TEST_URL: ${{ vars.SITE_TEST_URL }}
+      run: |
+        retry_count=0
+        MAX_RETRIES=10
+        SLEEP_DURATION=60
+
+        echo SITE_TEST_URL=$SITE_TEST_URL
+        echo URL=$URL
+        CURL_COMMAND="curl -s --header 'Host: $SITE_TEST_URL' http://$URL"
+        
+        while [ $retry_count -lt $MAX_RETRIES ]; do
+          if $CURL_COMMAND; then
+            curl -i --header "Host: $SITE_TEST_URL" http://$URL
+            echo "\nCurl test succeeded!\nService status: "
+            curl -s --header "Host: $SITE_TEST_URL" http://$URL/healthz | jq -r .status | grep -i healthy
+            exit 0
+          else
+            echo "Curl command failed. Retry $((retry_count + 1))/$MAX_RETRIES after $SLEEP_DURATION seconds..."
+            retry_count=$((retry_count + 1))
+            if [ $retry_count -lt $MAX_RETRIES ]; then
+              sleep $SLEEP_DURATION
+            else
+              echo "Max retries reached. Exiting with failure..."
+              exit 1
+            fi
+          fi
+        done
