@@ -162,28 +162,14 @@ jobs:
 
     # Login to Azure ACR authenticated via OIDC
     - name: Login to Azure ACR
-      id: login-acr
       run: |
         az acr login --name ${{ env.ACR_NAME }}
-
-
-    # Configure AWS credentials for ECR
-    # - name: Configure AWS Credentials
-    #   uses: aws-actions/configure-aws-credentials@v4
-    #   with:
-    #     role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-    #     aws-region: ${{ vars.AWS_REGION }}
-
-    # Login to AWS ECR
-    # - name: Login to Amazon ECR
-    #   id: login-ecr
-    #   uses: aws-actions/amazon-ecr-login@v2
 
     # Tag and push Docker image to ECR
     - name: Tag and push Docker image to ECR
       id: tag-and-push
       env:
-        ACR_REGISTRY: ${{ steps.login-acr.outputs.registry }}
+        ACR_REGISTRY: ${{ env.ACR_NAME }}.azurecr.io
         ACR_REPOSITORY: ${{ env.ACR_REPO_NAME }}
         LATEST_TAG: latest
         IMAGE_TAG: ${{ needs.test-and-build.outputs.image_tag }}
@@ -205,8 +191,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    outputs:
-      APP_ALB_HOST_URL: ${{ steps.set-ingress-host-address.outputs.APP_ALB_HOST_URL }}
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -225,65 +209,16 @@ jobs:
         IMAGE_TAG: ${{ needs.test-and-build.outputs.image_tag }}
       run: |
         az webapp config container set \
-          --name ${{ env.WEBAPP_NAME }} \
-          --resource-group ${{ env.RESOURCE_GROUP }} \
-          --docker-custom-image-name: ${{ env.ACR_NAME }}.azurecr.io/${{ env.ACR_REPO_NAME }}:$IMAGE_TAG \
-          --docker-registry-servdr-url https://${{ env.ACR_NAME }}.azurecr.io
+          -n ${{ env.WEBAPP_NAME }} \
+          -g ${{ env.RESOURCE_GROUP }} \
+          -c ${{ env.ACR_NAME }}.azurecr.io/${{ env.ACR_REPO_NAME }}:$IMAGE_TAG
 
     # Restart Web App to apply the new container image
     - name: Restart Web App
       run: |
-        az webapp restart --name $${{ env.WEBAPP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
-
-    # # Configure AWS credentials for ECR
-    # - name: Configure AWS Credentials
-    #   uses: aws-actions/configure-aws-credentials@v4
-    #   with:
-    #     role-to-assume: ${{ secrets.AWS_ROLE_ARN_FOR_DEPLOY }}
-    #     aws-region: ${{ vars.AWS_REGION }}
-
-    # - name: Update Kubeconfig
-    #   uses: silverlyra/setup-aws-eks@v0.1
-    #   with:
-    #       cluster: ${{ vars.EKS_CLUSTER_NAME }}
-
-    # - name: Check K8s cluster reachable by getting K8s nodes
-    #   run: |
-    #     echo ---------------------------
-    #     kubectl get nodes
-
-    # # add variables for NAMESPACE, REPLICAS, K8s_Image
-    # - name: Replace Token in Manifest files      
-    #   uses: cschleiden/replace-tokens@v1
-    #   with:
-    #     tokenPrefix: '${'
-    #     tokenSuffix: '}'
-    #     files: '["kubernetes/*.yaml"]'
-    #   env:
-    #     NAMESPACE: ${{ vars.NAMESPACE }}
-    #     K8S_IMAGE_ECR: ${{ needs.push-to-ecr.outputs.ecr_address }}
-    #     K8S_IMAGE_REPO: ${{ env.ECR_REPO_NAME }}
-    #     K8S_IMAGE_TAG: ${{ needs.test-and-build.outputs.image_tag }}
-
-    # - name: Check files were updated
-    #   run: |
-    #     cat kubernetes/*.yaml   
-
-    # - name: Deploy to EKS
-    #   env:
-    #     NAMESPACE: ${{ vars.NAMESPACE }}
-    #     ACR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-    #     ACR_REPOSITORY: ${{ env.ACR_NAME }}
-    #     IMAGE_FULL_TAG: ${{ needs.push-to-ecr.outputs.IMAGE_FULL_TAG }}
-    #   run: |
-    #     kubectl apply -f kubernetes/
-    #     kubectl rollout status deployment/python-app -n $NAMESPACE        
-
-    # - name: Set App Ingress Host URL
-    #   id: set-ingress-host-address
-    #   run: |  
-    #     echo "APP_ALB_HOST_URL=$(kubectl -n ${{ vars.NAMESPACE }} get ing -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')" >> $GITHUB_OUTPUT
-
+        az webapp stop -n ${{ env.WEBAPP_NAME }} -g ${{ env.RESOURCE_GROUP }}
+        sleep 20
+        az webapp start -n ${{ env.WEBAPP_NAME }} -g ${{ env.RESOURCE_GROUP }}
 
   integration-testing:
     name: ENV Integration Testing
@@ -292,7 +227,7 @@ jobs:
     steps:
     - name: Test URL Output using curl and jq
       env:
-        URL: ${{ needs.dev-deploy.outputs.APP_ALB_HOST_URL }}
+        URL: ${{ vars.SITE_TEST_URL }}        # flexibility to use different hostname and dns-name during the test
         SITE_TEST_URL: ${{ vars.SITE_TEST_URL }}
       run: |
         retry_count=0
@@ -301,13 +236,13 @@ jobs:
 
         echo SITE_TEST_URL=$SITE_TEST_URL
         echo URL=$URL
-        CURL_COMMAND="curl -s --header 'Host: $SITE_TEST_URL' http://$URL"
+        CURL_COMMAND="curl -s --header 'Host: $SITE_TEST_URL' https://$URL"
         
         while [ $retry_count -lt $MAX_RETRIES ]; do
           if $CURL_COMMAND; then
-            curl -i --header "Host: $SITE_TEST_URL" http://$URL
+            curl -i --header "Host: $SITE_TEST_URL" https://$URL
             echo "\nCurl test succeeded!\nService status: "
-            curl -s --header "Host: $SITE_TEST_URL" http://$URL/healthz | jq -r .status | grep -i healthy
+            curl -s --header "Host: $SITE_TEST_URL" https://$URL/healthz | jq -r .status | grep -i healthy
             exit 0
           else
             echo "Curl command failed. Retry $((retry_count + 1))/$MAX_RETRIES after $SLEEP_DURATION seconds..."
